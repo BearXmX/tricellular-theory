@@ -1206,43 +1206,111 @@ function makeBeltBand(lat: number, color: number, opacity: number) {
 
 function createCirculationCells() {
   const defs = [
-    { a: 0, b: 30, name: '低纬环流\n哈德莱环流', color: 0xff55b8, showLabel: true },
-    { a: 30, b: 60, name: '中纬环流\n费雷尔环流', color: 0xffd34f, showLabel: true },
-    { a: 60, b: 88, name: '高纬环流\n极地环流', color: 0x52d9ff, showLabel: true },
-    { a: 0, b: -30, name: '低纬环流\n哈德莱环流', color: 0xff55b8, showLabel: true },
-    { a: -30, b: -60, name: '中纬环流\n费雷尔环流', color: 0xffd34f, showLabel: true },
-    { a: -60, b: -88, name: '高纬环流\n极地环流', color: 0x52d9ff, showLabel: true },
+    // 北半球
+    {
+      a: 0,
+      b: 30,
+      name: '低纬环流\n哈德莱环流',
+      color: 0xff55b8,
+      showLabel: true,
+      reverseParticle: false,
+    },
+    {
+      a: 30,
+      b: 60,
+      name: '中纬环流\n费雷尔环流',
+      color: 0xffd34f,
+      showLabel: true,
+      reverseParticle: true,
+    },
+    {
+      a: 60,
+      b: 88,
+      name: '高纬环流\n极地环流',
+      color: 0x52d9ff,
+      showLabel: true,
+      reverseParticle: false,
+    },
+
+    // 南半球
+    {
+      a: 0,
+      b: -30,
+      name: '低纬环流\n哈德莱环流',
+      color: 0xff55b8,
+      showLabel: true,
+      reverseParticle: true,
+    },
+    {
+      a: -30,
+      b: -60,
+      name: '中纬环流\n费雷尔环流',
+      color: 0xffd34f,
+      showLabel: true,
+      reverseParticle: false,
+    },
+    {
+      a: -60,
+      b: -88,
+      name: '高纬环流\n极地环流',
+      color: 0x52d9ff,
+      showLabel: true,
+      reverseParticle: true,
+    },
   ]
 
   defs.forEach((d, cellIndex) => {
     const lon = -112
     const cellPath = createClosedCellPath(d.a, d.b, lon)
+
+    // 路径线本身没有方向，继续用原路径画线即可
     cellGroup.add(makeTubeLine(cellPath, d.color, 0.018, 0.75))
+
     if (d.showLabel) {
       cellGroup.add(createSpriteText(d.name, '#ffffff', latLngToVec3((d.a + d.b) / 2, lon - 15, R + 1.16), 0.48))
     }
 
+    // 粒子路径单独处理方向
+    const particlePath = d.reverseParticle ? [...cellPath].reverse() : cellPath
+
     const particleCount = Math.max(10, Math.floor((params.particleDensity / 100) * 18))
+
     for (let i = 0; i < particleCount; i++) {
       const color = new THREE.Color(d.color).lerp(new THREE.Color(0xffffff), 0.25)
+
       const mesh = new THREE.Mesh(
         new THREE.SphereGeometry(0.045 + Math.random() * 0.014, 12, 12),
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 }),
+        new THREE.MeshBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.9,
+        }),
       )
+
       const halo = new THREE.Mesh(
         new THREE.SphereGeometry(0.085 + Math.random() * 0.02, 12, 12),
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.13, depthWrite: false }),
+        new THREE.MeshBasicMaterial({
+          color,
+          transparent: true,
+          opacity: 0.13,
+          depthWrite: false,
+        }),
       )
+
       particleGroup.add(mesh, halo)
+
       circulationParticles.push({
         mesh,
         halo,
-        points: cellPath,
+        points: particlePath,
         progress: (i / particleCount + cellIndex * 0.07) % 1,
         speed: 0.055 + Math.random() * 0.025,
       })
     }
   })
+
+  // 垂直方向标注本身是对的：
+  // 赤道、60°附近上升；30°、极地附近下沉。
   ;[0, 60, -60].forEach(lat => cellGroup.add(createVerticalFlow(lat, -108, true)))
   ;[30, -30, 88, -88].forEach(lat => cellGroup.add(createVerticalFlow(lat, -108, false)))
 }
