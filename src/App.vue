@@ -372,6 +372,19 @@ type DrawStroke = {
   points: DrawGeoPoint[]
 }
 
+type DrawCanvasPoint = {
+  // 2D 绘制使用归一化画布坐标，不再依赖 Three.js 相机投影。
+  // x/y 范围都是 0—1，切换 2D/3D 或画布尺寸变化后仍能稳定重绘。
+  x: number
+  y: number
+}
+
+type DrawStroke2D = {
+  color: string
+  width: number
+  points: DrawCanvasPoint[]
+}
+
 const RangeRow = defineComponent({
   name: 'RangeRow',
   props: {
@@ -409,7 +422,6 @@ const currentTexture = ref('Material.002_diffuse.jpg')
 const themePreset = ref<'quantum' | 'aurora' | 'nebula' | 'teal' | 'gold'>('quantum')
 const featureFlags = reactive({
   climateLink: true,
-  errorDiagnosis: true,
   seasonCompare: false,
   oceanImpact: true,
 })
@@ -417,8 +429,15 @@ const activeInfo = ref<{ title: string; desc: string; tags?: string[] } | null>(
 
 const isDrawing = ref(false)
 const currentStroke = ref<DrawStroke | null>(null)
-const drawStrokes = ref<DrawStroke[]>([])
-const lastDrawPoint = ref<{ x: number; y: number } | null>(null)
+const currentCanvasStroke = ref<DrawStroke2D | null>(null)
+
+// 3D 球面绘制和 2D 展开图绘制必须分开保存。
+// 3D：保存经纬度，重绘时贴回球面。
+// 2D：保存归一化画布坐标，重绘时直接画到 canvas。
+// 不能让 2D 也保存经纬度再走 project(camera)，否则来回切换模式时相机状态一变，线条就会乱跑。
+const drawStrokes3D = ref<DrawStroke[]>([])
+const drawStrokes2D = ref<DrawStroke2D[]>([])
+const lastDrawPoint = ref<DrawCanvasPoint | null>(null)
 
 const layers = reactive({
   pressure: true,
@@ -430,17 +449,20 @@ const layers = reactive({
   particles: true,
 })
 
+const monthShiftMap = [-15, -12, -8, -3, 4, 10, 15, 12, 6, 0, -7, -12]
+const defaultMonth = 6
+
 const params = reactive({
   autoRotate: true,
   rotateSpeed: 1,
   tilt: 23,
-  month: 6,
-  seasonShift: 0,
+  month: defaultMonth,
+  // 修复：默认显示 6 月时，气压带、风带也要直接进入 6 月北移状态。
+  // 原来 month = 6 但 seasonShift = 0，导致首屏文字是夏季，图像却没有北移。
+  seasonShift: monthShiftMap[defaultMonth - 1]!,
   cellSpeed: 3,
   particleDensity: 70,
 })
-
-const monthShiftMap = [-15, -12, -8, -3, 4, 10, 15, 12, 6, 0, -7, -12]
 
 const seasonTip = computed(() => {
   if ([3, 4, 5].includes(params.month)) return '春季：气压带、风带由南向北移动。'
@@ -474,7 +496,6 @@ const circulationParticles: ParticleItem[] = []
 const raycaster = new THREE.Raycaster()
 const clickRaycaster = new THREE.Raycaster()
 const pointerNdc = new THREE.Vector2()
-const flatDrawPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0)
 let lastSurfaceDrawPoint: THREE.Vector3 | null = null
 
 const pressureBelts = [
@@ -613,13 +634,14 @@ function setViewMode(mode: ViewMode) {
   eraserMode.value = false
   isDrawing.value = false
   currentStroke.value = null
+  currentCanvasStroke.value = null
   lastDrawPoint.value = null
   lastSurfaceDrawPoint = null
 
   if (controls) controls.enabled = true
 
   applyViewMode()
-  nextTick(renderSharedDrawings)
+  renderDrawingsAfterLayout()
 }
 
 function setEarthTexture(file: string) {
@@ -634,10 +656,15 @@ function setEarthTexture(file: string) {
 function applyEarthTexture(texture: THREE.Texture) {
   const material = globe?.material as THREE.MeshBasicMaterial | undefined
   if (!material) return
+
+  const oldMap = material.map
   texture.colorSpace = THREE.SRGBColorSpace
   texture.anisotropy = renderer.capabilities.getMaxAnisotropy()
   material.map = texture
   material.needsUpdate = true
+
+  // 切换贴图时释放旧贴图，避免老师反复切贴图后显存越占越多。
+  if (oldMap && oldMap !== texture) oldMap.dispose()
 }
 
 function export2DImage() {
@@ -649,10 +676,11 @@ function export2DImage() {
   drawMode.value = false
   if (controls) controls.enabled = true
   applyViewMode()
-  renderSharedDrawings()
-  renderer.render(scene, camera)
 
   requestAnimationFrame(() => {
+    renderSharedDrawings()
+    renderer.render(scene, camera)
+
     const webglCanvas = renderer.domElement
     const drawCanvas = drawCanvasRef.value
     const output = document.createElement('canvas')
@@ -674,7 +702,7 @@ function export2DImage() {
     viewMode.value = oldMode
     drawMode.value = oldDrawMode
     applyViewMode()
-    nextTick(renderSharedDrawings)
+    renderDrawingsAfterLayout()
   })
 }
 
@@ -725,63 +753,105 @@ function toggleDrawMode() {
 }
 
 function clearDrawings() {
-  const canvas = drawCanvasRef.value
-  const ctx = canvas?.getContext('2d')
-  if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
-  drawStrokes.value = []
+  // 只清空当前模式下的绘制内容。
+  // 3D 和 2D 是两套板书，不能互相影响。
+  if (viewMode.value === '3d') drawStrokes3D.value = []
+  else drawStrokes2D.value = []
+
   currentStroke.value = null
-  if (drawGroup) clearGroup(drawGroup)
+  currentCanvasStroke.value = null
+  lastDrawPoint.value = null
+  lastSurfaceDrawPoint = null
+
+  renderSharedDrawings()
 }
 
 function undoDrawing() {
-  drawStrokes.value = drawStrokes.value.slice(0, -1)
+  // 回退也只回退当前模式，避免 2D 回退误删 3D 球面标注。
+  if (viewMode.value === '3d') drawStrokes3D.value = drawStrokes3D.value.slice(0, -1)
+  else drawStrokes2D.value = drawStrokes2D.value.slice(0, -1)
+
   renderSharedDrawings()
 }
 
 function handleDrawStart(e: PointerEvent) {
   if (!drawMode.value || !drawCanvasRef.value) return
-  isDrawing.value = true
-  drawCanvasRef.value.setPointerCapture?.(e.pointerId)
 
-  const geoPoint = getPointerGeoPoint(e)
-  if (!geoPoint) return
+  if (viewMode.value === '3d') {
+    const surfacePoint = getSurfaceDrawPoint(e)
+    if (!surfacePoint) {
+      isDrawing.value = false
+      currentStroke.value = null
+      currentCanvasStroke.value = null
+      lastSurfaceDrawPoint = null
+      return
+    }
 
-  if (eraserMode.value) {
-    eraseDrawingAt(geoPoint)
+    isDrawing.value = true
+    drawCanvasRef.value.setPointerCapture?.(e.pointerId)
+
+    const geo = vec3ToGeo(surfacePoint)
+
+    if (eraserMode.value) {
+      erase3DDrawingAt(geo)
+      return
+    }
+
+    currentStroke.value = {
+      color: drawColor.value,
+      width: 0.018,
+      points: [geo],
+    }
+    currentCanvasStroke.value = null
+    lastSurfaceDrawPoint = geoToVec3(geo, R + 0.075)
     return
   }
 
-  currentStroke.value = {
-    color: drawColor.value,
-    width: 0.018,
-    points: [geoPoint],
+  const canvasPoint = getCanvasNormalizedPoint(e)
+  if (!canvasPoint) {
+    isDrawing.value = false
+    currentStroke.value = null
+    currentCanvasStroke.value = null
+    lastDrawPoint.value = null
+    return
   }
 
-  if (viewMode.value === '3d') {
-    lastSurfaceDrawPoint = geoToVec3(geoPoint, R + 0.075)
-  } else {
-    lastDrawPoint.value = projectGeoToCanvas(geoPoint)
+  isDrawing.value = true
+  drawCanvasRef.value.setPointerCapture?.(e.pointerId)
+
+  if (eraserMode.value) {
+    erase2DDrawingAt(canvasPoint)
+    return
   }
+
+  currentCanvasStroke.value = {
+    color: drawColor.value,
+    width: 3,
+    points: [canvasPoint],
+  }
+  currentStroke.value = null
+  lastDrawPoint.value = canvasPoint
 }
 
 function handleDrawMove(e: PointerEvent) {
   if (!drawMode.value || !isDrawing.value) return
 
-  const geoPoint = getPointerGeoPoint(e)
-  if (!geoPoint) return
-
-  if (eraserMode.value) {
-    eraseDrawingAt(geoPoint)
-    return
-  }
-
-  if (!currentStroke.value) return
-  const lastGeo = currentStroke.value.points[currentStroke.value.points.length - 1]
-  if (geoDistance(lastGeo!, geoPoint) < 0.35) return
-
-  currentStroke.value.points.push(geoPoint)
-
   if (viewMode.value === '3d') {
+    const surfacePoint = getSurfaceDrawPoint(e)
+    if (!surfacePoint) return
+    const geoPoint = vec3ToGeo(surfacePoint)
+
+    if (eraserMode.value) {
+      erase3DDrawingAt(geoPoint)
+      return
+    }
+
+    if (!currentStroke.value) return
+    const lastGeo = currentStroke.value.points[currentStroke.value.points.length - 1]
+    if (geoDistance(lastGeo!, geoPoint) < 0.35) return
+
+    currentStroke.value.points.push(geoPoint)
+
     const current = geoToVec3(geoPoint, R + 0.075)
     if (!lastSurfaceDrawPoint || !drawGroup) return
     drawGroup.add(makeTubeLine([lastSurfaceDrawPoint, current], hexColorToNumber(drawColor.value), 0.018, 0.98))
@@ -789,26 +859,21 @@ function handleDrawMove(e: PointerEvent) {
     return
   }
 
-  const canvas = drawCanvasRef.value
-  if (!canvas || !lastDrawPoint.value) return
-  const ctx = canvas.getContext('2d')
-  if (!ctx) return
+  const canvasPoint = getCanvasNormalizedPoint(e)
+  if (!canvasPoint) return
 
-  const p = projectGeoToCanvas(geoPoint)
-  const last = lastDrawPoint.value
-  ctx.save()
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  ctx.strokeStyle = drawColor.value
-  ctx.shadowColor = drawColor.value
-  ctx.shadowBlur = 10
-  ctx.lineWidth = 3
-  ctx.beginPath()
-  ctx.moveTo(last.x, last.y)
-  ctx.lineTo(p.x, p.y)
-  ctx.stroke()
-  ctx.restore()
-  lastDrawPoint.value = p
+  if (eraserMode.value) {
+    erase2DDrawingAt(canvasPoint)
+    return
+  }
+
+  if (!currentCanvasStroke.value) return
+  const last = currentCanvasStroke.value.points[currentCanvasStroke.value.points.length - 1]
+  if (canvasDistancePx(last!, canvasPoint) < 2.5) return
+
+  currentCanvasStroke.value.points.push(canvasPoint)
+  draw2DSegment(last!, canvasPoint, currentCanvasStroke.value.color, currentCanvasStroke.value.width)
+  lastDrawPoint.value = canvasPoint
 }
 
 function handleDrawEnd(e: PointerEvent) {
@@ -817,38 +882,139 @@ function handleDrawEnd(e: PointerEvent) {
   lastDrawPoint.value = null
   lastSurfaceDrawPoint = null
 
-  if (currentStroke.value && currentStroke.value.points.length > 1 && !eraserMode.value) {
-    const next = [...drawStrokes.value, currentStroke.value]
-    drawStrokes.value = next.slice(-20)
-    const avgLat = currentStroke.value.points.reduce((sum, p) => sum + p.lat, 0) / currentStroke.value.points.length
-    showClimateInfo(avgLat)
+  if (viewMode.value === '3d') {
+    if (currentStroke.value && currentStroke.value.points.length > 1 && !eraserMode.value) {
+      const next = [...drawStrokes3D.value, currentStroke.value]
+      drawStrokes3D.value = next.slice(-20)
+
+      const avgLat = currentStroke.value.points.reduce((sum, p) => sum + p.lat, 0) / currentStroke.value.points.length
+      showClimateInfo(avgLat)
+    }
+
+    currentStroke.value = null
+    currentCanvasStroke.value = null
+    renderSharedDrawings()
+    return
   }
+
+  if (currentCanvasStroke.value && currentCanvasStroke.value.points.length > 1 && !eraserMode.value) {
+    const next = [...drawStrokes2D.value, currentCanvasStroke.value]
+    drawStrokes2D.value = next.slice(-20)
+
+    // 2D 画布坐标不再通过相机求经纬度，但 y 方向仍对应纬度：顶部约 90°N，底部约 90°S。
+    const avgY = currentCanvasStroke.value.points.reduce((sum, p) => sum + p.y, 0) / currentCanvasStroke.value.points.length
+    showClimateInfo(90 - avgY * 180)
+  }
+
   currentStroke.value = null
+  currentCanvasStroke.value = null
   renderSharedDrawings()
 }
 
-function getDrawPoint(e: PointerEvent) {
-  const canvas = drawCanvasRef.value!
+function getCanvasNormalizedPoint(e: PointerEvent): DrawCanvasPoint | null {
+  const canvas = drawCanvasRef.value
+  if (!canvas) return null
   const rect = canvas.getBoundingClientRect()
-  const scaleX = canvas.width / rect.width
-  const scaleY = canvas.height / rect.height
+  if (!rect.width || !rect.height) return null
+
   return {
-    x: (e.clientX - rect.left) * scaleX,
-    y: (e.clientY - rect.top) * scaleY,
+    x: THREE.MathUtils.clamp((e.clientX - rect.left) / rect.width, 0, 1),
+    y: THREE.MathUtils.clamp((e.clientY - rect.top) / rect.height, 0, 1),
   }
+}
+
+function canvasPointToPixel(point: DrawCanvasPoint) {
+  const canvas = drawCanvasRef.value!
+  return {
+    x: point.x * canvas.width,
+    y: point.y * canvas.height,
+  }
+}
+
+function canvasDistancePx(a: DrawCanvasPoint, b: DrawCanvasPoint) {
+  const canvas = drawCanvasRef.value
+  if (!canvas) return Number.POSITIVE_INFINITY
+  const dx = (a.x - b.x) * canvas.width
+  const dy = (a.y - b.y) * canvas.height
+  return Math.sqrt(dx * dx + dy * dy)
+}
+
+function draw2DSegment(a: DrawCanvasPoint, b: DrawCanvasPoint, color: string, width = 3) {
+  const canvas = drawCanvasRef.value
+  const ctx = canvas?.getContext('2d')
+  if (!canvas || !ctx) return
+
+  const p1 = canvasPointToPixel(a)
+  const p2 = canvasPointToPixel(b)
+
+  ctx.save()
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.strokeStyle = color
+  ctx.shadowColor = color
+  ctx.shadowBlur = 10
+  ctx.lineWidth = width
+  ctx.beginPath()
+  ctx.moveTo(p1.x, p1.y)
+  ctx.lineTo(p2.x, p2.y)
+  ctx.stroke()
+  ctx.restore()
+}
+
+function draw2DStroke(stroke: DrawStroke2D) {
+  if (stroke.points.length < 2) return
+
+  const canvas = drawCanvasRef.value
+  const ctx = canvas?.getContext('2d')
+  if (!canvas || !ctx) return
+
+  ctx.save()
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  ctx.strokeStyle = stroke.color
+  ctx.shadowColor = stroke.color
+  ctx.shadowBlur = 10
+  ctx.lineWidth = stroke.width
+  ctx.beginPath()
+
+  const first = canvasPointToPixel(stroke.points[0]!)
+  ctx.moveTo(first.x, first.y)
+
+  for (let i = 1; i < stroke.points.length; i++) {
+    const p = canvasPointToPixel(stroke.points[i]!)
+    ctx.lineTo(p.x, p.y)
+  }
+
+  ctx.stroke()
+  ctx.restore()
 }
 
 function handleStageClick(e: MouseEvent) {
   if (drawMode.value) return
-  const geo = getPointerGeoPoint(e as PointerEvent)
-  if (geo) showClimateInfo(geo.lat)
+
+  // 2D 模式下不要再走 Three.js 平面射线求纬度。
+  // 画布和相机切换后，射线落点可能和用户视觉上的 2D 图不完全一致。
+  // 这里直接按画布 y 坐标估算纬度：顶部约 90°N，底部约 90°S。
+  if (viewMode.value === '2d') {
+    const canvasPoint = getCanvasNormalizedPoint(e as PointerEvent)
+    if (canvasPoint) showClimateInfo(90 - canvasPoint.y * 180)
+    return
+  }
+
+  const surfacePoint = getSurfaceDrawPoint(e as PointerEvent)
+  if (surfacePoint) showClimateInfo(vec3ToGeo(surfacePoint).lat)
 
   if (viewMode.value === '3d' && drawCanvasRef.value) {
     const rect = drawCanvasRef.value.getBoundingClientRect()
     pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
     pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
     clickRaycaster.setFromCamera(pointerNdc, camera)
-    const hits = clickRaycaster.intersectObjects([...currentGroup.children, ...windGroup.children], true)
+
+    const clickableObjects: THREE.Object3D[] = []
+    if (layers.currents) clickableObjects.push(...currentGroup.children)
+    if (layers.wind) clickableObjects.push(...windGroup.children)
+
+    const hits = clickRaycaster.intersectObjects(clickableObjects, true)
     const currentHit = hits.find(h => h.object.userData.currentName)
     if (currentHit) {
       showOceanImpact(currentHit.object.userData.currentType, currentHit.object.userData.currentName)
@@ -857,14 +1023,6 @@ function handleStageClick(e: MouseEvent) {
     const windHit = hits.find(h => h.object.userData.windName)
     if (windHit) showWindInfo(windHit.object.userData.windName, windHit.object.userData.windLat)
   }
-}
-
-function getPointerGeoPoint(e: PointerEvent): DrawGeoPoint | null {
-  if (viewMode.value === '3d') {
-    const p = getSurfaceDrawPoint(e)
-    return p ? vec3ToGeo(p) : null
-  }
-  return getFlatGeoPoint(e)
 }
 
 function getSurfaceDrawPoint(e: PointerEvent) {
@@ -879,22 +1037,6 @@ function getSurfaceDrawPoint(e: PointerEvent) {
 
   const local = earthGroup.worldToLocal(hits[0]!.point.clone())
   return local.normalize().multiplyScalar(R + 0.075)
-}
-
-function getFlatGeoPoint(e: PointerEvent): DrawGeoPoint | null {
-  if (!drawCanvasRef.value) return null
-  const rect = drawCanvasRef.value.getBoundingClientRect()
-  pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
-  pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
-
-  raycaster.setFromCamera(pointerNdc, camera)
-  const hit = new THREE.Vector3()
-  const ok = raycaster.ray.intersectPlane(flatDrawPlane, hit)
-  if (!ok) return null
-
-  const lon = THREE.MathUtils.clamp((hit.x / 10.8) * 360, -180, 180)
-  const lat = THREE.MathUtils.clamp((hit.y / 5.8) * 180, -90, 90)
-  return { lat, lon }
 }
 
 function vec3ToGeo(v: THREE.Vector3): DrawGeoPoint {
@@ -918,10 +1060,20 @@ function hexColorToNumber(color: string) {
   return Number(color.replace('#', '0x'))
 }
 
-function eraseDrawingAt(point: DrawGeoPoint) {
-  const threshold = viewMode.value === '3d' ? 4 : 7
-  drawStrokes.value = drawStrokes.value.filter(stroke => !stroke.points.some(p => geoDistance(p, point) < threshold))
+function erase3DDrawingAt(point: DrawGeoPoint) {
+  drawStrokes3D.value = drawStrokes3D.value.filter(stroke => !stroke.points.some(p => geoDistance(p, point) < 4))
   renderSharedDrawings()
+}
+
+function erase2DDrawingAt(point: DrawCanvasPoint) {
+  drawStrokes2D.value = drawStrokes2D.value.filter(stroke => !stroke.points.some(p => canvasDistancePx(p, point) < 14))
+  renderSharedDrawings()
+}
+
+function renderDrawingsAfterLayout() {
+  nextTick(() => {
+    requestAnimationFrame(() => renderSharedDrawings())
+  })
 }
 
 function renderSharedDrawings() {
@@ -932,7 +1084,7 @@ function renderSharedDrawings() {
   if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
 
   if (viewMode.value === '3d') {
-    drawStrokes.value.forEach(stroke => {
+    drawStrokes3D.value.forEach(stroke => {
       for (let i = 1; i < stroke.points.length; i++) {
         const a = geoToVec3(stroke.points[i - 1]!, R + 0.075)
         const b = geoToVec3(stroke.points[i]!, R + 0.075)
@@ -942,36 +1094,7 @@ function renderSharedDrawings() {
     return
   }
 
-  if (!canvas || !ctx) return
-  drawStrokes.value.forEach(stroke => {
-    if (stroke.points.length < 2) return
-    ctx.save()
-    ctx.lineCap = 'round'
-    ctx.lineJoin = 'round'
-    ctx.strokeStyle = stroke.color
-    ctx.shadowColor = stroke.color
-    ctx.shadowBlur = 10
-    ctx.lineWidth = 3
-    ctx.beginPath()
-    const first = projectGeoToCanvas(stroke.points[0]!)
-    ctx.moveTo(first.x, first.y)
-    for (let i = 1; i < stroke.points.length; i++) {
-      const p = projectGeoToCanvas(stroke.points[i]!)
-      ctx.lineTo(p.x, p.y)
-    }
-    ctx.stroke()
-    ctx.restore()
-  })
-}
-
-function projectGeoToCanvas(point: DrawGeoPoint) {
-  const canvas = drawCanvasRef.value!
-  const world = new THREE.Vector3((point.lon / 360) * 10.8, (point.lat / 180) * 5.8, 0.9)
-  const ndc = world.clone().project(camera)
-  return {
-    x: ((ndc.x + 1) / 2) * canvas.width,
-    y: ((1 - ndc.y) / 2) * canvas.height,
-  }
+  drawStrokes2D.value.forEach(draw2DStroke)
 }
 
 function initThree() {
@@ -1099,13 +1222,41 @@ function rebuildAll() {
   renderSharedDrawings()
 }
 
-function clearGroup(group: THREE.Group) {
+function disposeMaterial(mat?: THREE.Material | THREE.Material[]) {
+  if (!mat) return
+
+  const disposeOne = (m: THREE.Material) => {
+    const materialWithMaps = m as THREE.Material & {
+      map?: THREE.Texture
+      alphaMap?: THREE.Texture
+      aoMap?: THREE.Texture
+      emissiveMap?: THREE.Texture
+      normalMap?: THREE.Texture
+      roughnessMap?: THREE.Texture
+      metalnessMap?: THREE.Texture
+      displacementMap?: THREE.Texture
+    }
+
+    materialWithMaps.map?.dispose()
+    materialWithMaps.alphaMap?.dispose()
+    materialWithMaps.aoMap?.dispose()
+    materialWithMaps.emissiveMap?.dispose()
+    materialWithMaps.normalMap?.dispose()
+    materialWithMaps.roughnessMap?.dispose()
+    materialWithMaps.metalnessMap?.dispose()
+    materialWithMaps.displacementMap?.dispose()
+    m.dispose()
+  }
+
+  if (Array.isArray(mat)) mat.forEach(disposeOne)
+  else disposeOne(mat)
+}
+
+function clearGroup(group: THREE.Group | THREE.Scene) {
   group.traverse(obj => {
     const mesh = obj as THREE.Mesh
-    if (mesh.geometry) mesh.geometry.dispose()
-    const mat = mesh.material as THREE.Material | THREE.Material[] | undefined
-    if (Array.isArray(mat)) mat.forEach(m => m.dispose())
-    else mat?.dispose()
+    mesh.geometry?.dispose()
+    disposeMaterial(mesh.material as THREE.Material | THREE.Material[] | undefined)
   })
   group.clear()
 }
@@ -1261,13 +1412,16 @@ function createCirculationCells() {
 
   defs.forEach((d, cellIndex) => {
     const lon = -112
-    const cellPath = createClosedCellPath(d.a, d.b, lon)
+    const shiftedA = getSeasonalCellLat(d.a)
+    const shiftedB = getSeasonalCellLat(d.b)
+    const cellPath = createClosedCellPath(shiftedA, shiftedB, lon)
 
-    // 路径线本身没有方向，继续用原路径画线即可
+    // 路径线本身没有方向，继续用原路径画线即可。
+    // 注意：环流圈也必须跟随月份移动，否则气压带/风带移动了，环流圈还停在原纬度，会造成教学错位。
     cellGroup.add(makeTubeLine(cellPath, d.color, 0.018, 0.75))
 
     if (d.showLabel) {
-      cellGroup.add(createSpriteText(d.name, '#ffffff', latLngToVec3((d.a + d.b) / 2, lon - 15, R + 1.16), 0.48))
+      cellGroup.add(createSpriteText(d.name, '#ffffff', latLngToVec3((shiftedA + shiftedB) / 2, lon - 15, R + 1.16), 0.48))
     }
 
     // 粒子路径单独处理方向
@@ -1311,8 +1465,13 @@ function createCirculationCells() {
 
   // 垂直方向标注本身是对的：
   // 赤道、60°附近上升；30°、极地附近下沉。
-  ;[0, 60, -60].forEach(lat => cellGroup.add(createVerticalFlow(lat, -108, true)))
-  ;[30, -30, 88, -88].forEach(lat => cellGroup.add(createVerticalFlow(lat, -108, false)))
+  // 但它们也要跟随气压带、风带一起季节移动，避免 7 月/1 月错位。
+  ;[0, 60, -60].forEach(lat => cellGroup.add(createVerticalFlow(getSeasonalCellLat(lat), -108, true)))
+  ;[30, -30, 88, -88].forEach(lat => cellGroup.add(createVerticalFlow(getSeasonalCellLat(lat), -108, false)))
+}
+
+function getSeasonalCellLat(lat: number) {
+  return clampLat(lat + seasonalOffset(lat))
 }
 
 function createClosedCellPath(latA: number, latB: number, lon: number) {
@@ -1670,10 +1829,11 @@ function createFlatMapReference() {
       y: -0.42,
       name: '东南信风',
       color: 0xff55b8,
+      // 修复：南半球东南信风应由东南吹向西北，2D 图中箭头应从右下指向左上。
       arrows: [
-        [-1.6, -0.55, -0.65, -0.24],
-        [-0.32, -0.55, 0.65, -0.24],
-        [0.95, -0.55, 1.9, -0.24],
+        [1.9, -0.55, 0.95, -0.24],
+        [0.65, -0.55, -0.32, -0.24],
+        [-0.65, -0.55, -1.6, -0.24],
       ],
     },
     {
@@ -1952,7 +2112,7 @@ function bindResize() {
       drawCanvas.height = Math.max(1, Math.floor(clientHeight * window.devicePixelRatio))
       drawCanvas.style.width = `${clientWidth}px`
       drawCanvas.style.height = `${clientHeight}px`
-      nextTick(renderSharedDrawings)
+      renderDrawingsAfterLayout()
     }
   }
   resizeObserver = new ResizeObserver(resize)
@@ -2001,12 +2161,8 @@ watch(
 )
 
 watch(layers, applyLayerVisibility, { deep: true })
-watch(viewMode, () => {
-  nextTick(() => {
-    rebuildAll()
-    renderSharedDrawings()
-  })
-})
+// 不再监听 viewMode 做 rebuildAll。
+// 2D/3D 切换只需要切显隐和相机，重建场景会打断 canvas 重绘节奏，导致 2D 板书偶发丢失或错位。
 watch(drawMode, () => {
   if (!controls) return
   controls.enabled = !drawMode.value
